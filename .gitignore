@@ -1,0 +1,8 @@
+/target/
+/dist/
+/.direnv/
+/.env
+*.log
+.DS_Store
+result
+result-*

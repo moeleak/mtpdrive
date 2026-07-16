@@ -1,0 +1,10 @@
+[alias]
+xtask = "run --package xtask --"
+
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/clang"
+rustflags = ["-C", "link-arg=-Wl,-rpath,@executable_path/../Frameworks"]
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/clang"
+rustflags = ["-C", "link-arg=-Wl,-rpath,@executable_path/../Frameworks"]

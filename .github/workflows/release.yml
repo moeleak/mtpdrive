@@ -1,0 +1,231 @@
+name: Release macOS DMG
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+      - "[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release
+        required: true
+        default: "0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_LTO: fat
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+  CARGO_PROFILE_RELEASE_PANIC: abort
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+            runner: macos-26
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            runner: macos-26-intel
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable --target "${{ matrix.target }}"
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.arch }}-release-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**', '.github/workflows/release.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-release-
+
+      - name: Build native release binaries
+        run: >-
+          cargo build --release --locked
+          --target "${{ matrix.target }}"
+          -p mtpdrive-app -p mtpdrive-cli
+
+      - name: Prepare architecture artifact
+        shell: bash
+        run: |
+          mkdir -p release-binaries
+          cp "target/${{ matrix.target }}/release/mtpdrive-app" release-binaries/
+          cp "target/${{ matrix.target }}/release/mtpdrive" release-binaries/
+          chmod +x release-binaries/*
+
+      - name: Upload architecture artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-${{ matrix.target }}
+          path: release-binaries/
+          if-no-files-found: error
+
+  package:
+    name: Package Universal DMG
+    runs-on: macos-26
+    needs: build
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable
+          rustup default stable
+
+      - name: Download Apple Silicon binaries
+        uses: actions/download-artifact@v6
+        with:
+          name: binaries-aarch64-apple-darwin
+          path: target/aarch64-apple-darwin/release
+
+      - name: Download Intel binaries
+        uses: actions/download-artifact@v6
+        with:
+          name: binaries-x86_64-apple-darwin
+          path: target/x86_64-apple-darwin/release
+
+      - name: Package and ad-hoc sign
+        run: |
+          chmod +x target/*-apple-darwin/release/mtpdrive*
+          cargo xtask dmg --skip-build
+
+      - name: Verify package
+        run: |
+          codesign --verify --deep --strict --verbose=2 dist/MTPDrive.app
+          hdiutil verify dist/MTPDrive-*-universal.dmg
+          cd dist
+          shasum -a 256 -c MTPDrive-*-universal.dmg.sha256
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v6
+        with:
+          name: MTPDrive-universal
+          path: |
+            dist/MTPDrive-*-universal.dmg
+            dist/MTPDrive-*-universal.dmg.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: package
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve and validate tag
+        id: release
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          version="${tag#v}"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "${version}" != "${cargo_version}" ]]; then
+            echo "Tag ${tag} does not match Cargo version ${cargo_version}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate changelog
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          git fetch --force --tags
+          previous_tag="$(
+            git tag --merged "${TAG}" --sort=-version:refname |
+              grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$' |
+              grep -v -F -x "${TAG}" |
+              head -n 1 || true
+          )"
+          if [[ -n "${previous_tag}" ]]; then
+            range="${previous_tag}..${TAG}"
+            heading="Changes since ${previous_tag}:"
+          else
+            range="${TAG}"
+            heading="Changes in this release:"
+          fi
+          commit_log="$(git log --no-merges --pretty=format:'- %s (%h)' "${range}")"
+          {
+            echo "MTPDrive ${VERSION} for macOS."
+            echo
+            echo "Universal application for Apple Silicon and Intel, distributed as an ad-hoc signed DMG."
+            echo
+            echo "## Changelog"
+            echo
+            echo "${heading}"
+            echo
+            if [[ -n "${commit_log}" ]]; then
+              printf '%s\n' "${commit_log}"
+            else
+              echo "- No commit changes found."
+            fi
+          } > release-notes.md
+
+      - name: Download Universal package
+        uses: actions/download-artifact@v6
+        with:
+          name: MTPDrive-universal
+          path: release-assets
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --title "MTPDrive ${VERSION}" --notes-file release-notes.md
+            gh release upload "${TAG}" release-assets/* --clobber
+          else
+            gh release create "${TAG}" release-assets/* \
+              --verify-tag \
+              --title "MTPDrive ${VERSION}" \
+              --notes-file release-notes.md
+          fi

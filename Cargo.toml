@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mtpdrive-core",
+    "crates/mtpdrive-cli",
+    "crates/mtpdrive-app",
+    "xtask",
+]
+default-members = [
+    "crates/mtpdrive-core",
+    "crates/mtpdrive-cli",
+    "crates/mtpdrive-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/moeleak/mtpdrive"
+authors = ["MoeLeak <i@leak.moe>"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+directories = "6.0"
+fractal-nfs = { path = "vendor/fractal-nfs", version = "=0.1.0" }
+futures = "0.3"
+iced = { version = "0.14", features = ["tokio"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+material-ui-rs = "=0.4.4"
+mtp-rs = { version = "=0.23.0", features = ["virtual-device"] }
+nix = { version = "0.30", features = ["user"] }
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.23"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+tokio = { version = "1.47", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tray-icon = { version = "0.24.1", default-features = false }
+uuid = { version = "1.18", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

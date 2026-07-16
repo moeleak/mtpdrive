@@ -1,0 +1,38 @@
+[package]
+name = "mtpdrive-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["real-mtp"]
+real-mtp = []
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+directories.workspace = true
+fractal-nfs.workspace = true
+futures.workspace = true
+libc.workspace = true
+mtp-rs.workspace = true
+nix.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
