@@ -14,12 +14,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::io::ReaderStream;
 
 const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(10);
 const DIRECTORY_FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_secs(1);
+const IMAGE_CAPTURE_RECLAIM_COOLDOWN: Duration = Duration::from_secs(10);
+const IMAGE_CAPTURE_DAEMON_PATH: &str = "/System/Library/Image Capture/Support/icdd";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectEntry {
@@ -600,6 +602,7 @@ pub struct DeviceManager {
     last_error: Arc<RwLock<Option<String>>>,
     last_change_millis: Arc<AtomicU64>,
     next_generation: Arc<AtomicU64>,
+    last_image_capture_reclaim: Arc<Mutex<Option<Instant>>>,
     logs: LogStore,
 }
 
@@ -624,6 +627,7 @@ impl DeviceManager {
             last_error: Arc::new(RwLock::new(None)),
             last_change_millis: Arc::new(AtomicU64::new(now_millis())),
             next_generation: Arc::new(AtomicU64::new(1)),
+            last_image_capture_reclaim: Arc::new(Mutex::new(None)),
             logs,
         }
     }
@@ -672,6 +676,21 @@ impl DeviceManager {
             }
         }
 
+        let has_unconnected_candidate = {
+            let connected = self.devices.read().await;
+            candidates.iter().any(|candidate| {
+                !connected
+                    .values()
+                    .any(|device| candidate_matches_connected(candidate, device))
+            })
+        };
+        if has_unconnected_candidate {
+            // Image Capture races MTP applications for Android's exclusive USB
+            // interface on macOS. Reclaim it before opening the first session so
+            // `icdd` cannot leave the device permanently unavailable in Finder.
+            let _ = self.reclaim_image_capture().await;
+        }
+
         let mut latest_error = None;
         for candidate in candidates {
             let key = device_key(&candidate);
@@ -684,7 +703,12 @@ impl DeviceManager {
             {
                 continue;
             }
-            match self.open_candidate(&candidate, key.clone()).await {
+            let mut opened = self.open_candidate(&candidate, key.clone()).await;
+            if opened.as_ref().is_err_and(is_exclusive_error) && self.reclaim_image_capture().await
+            {
+                opened = self.open_candidate(&candidate, key.clone()).await;
+            }
+            match opened {
                 Ok(connected) => {
                     self.open_failures.write().await.remove(&key);
                     self.logs.emit(
@@ -782,6 +806,49 @@ impl DeviceManager {
 
     fn mark_changed(&self) {
         mark_timestamp_changed(&self.last_change_millis);
+    }
+
+    async fn reclaim_image_capture(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let mut last_reclaim = self.last_image_capture_reclaim.lock().await;
+            let now = Instant::now();
+            if last_reclaim.is_some_and(|last| {
+                now.saturating_duration_since(last) < IMAGE_CAPTURE_RECLAIM_COOLDOWN
+            }) {
+                return false;
+            }
+
+            match terminate_image_capture_daemon().await {
+                Ok(0) => false,
+                Ok(count) => {
+                    *last_reclaim = Some(now);
+                    self.logs.emit(
+                        LogLevel::Info,
+                        "mtp",
+                        current_language().image_capture_reclaimed(count),
+                    );
+                    // The process has exited, but IOKit releases its exclusive
+                    // interface claim asynchronously. A short grace period avoids
+                    // racing that teardown while still beating launchd's respawn.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    true
+                }
+                Err(error) => {
+                    *last_reclaim = Some(now);
+                    self.logs.emit(
+                        LogLevel::Warn,
+                        "mtp",
+                        current_language().image_capture_reclaim_failed(error),
+                    );
+                    false
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     pub async fn list(
@@ -1302,11 +1369,85 @@ fn candidate_matches_connected(candidate: &MtpDeviceInfo, connected: &ConnectedD
 fn open_error_message(key: &str, error: &Error) -> String {
     let language = current_language();
     let detail = error.to_string();
-    if detail.contains("held exclusively by another process") {
+    if is_exclusive_error(error) {
         language.device_exclusively_held(key)
     } else {
         language.open_device_failed(key, detail)
     }
+}
+
+fn is_exclusive_error(error: &Error) -> bool {
+    matches!(error, Error::Mtp(source) if source.is_exclusive_access())
+}
+
+#[cfg(target_os = "macos")]
+async fn terminate_image_capture_daemon() -> std::io::Result<usize> {
+    use nix::unistd::Uid;
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let output = Command::new("/bin/ps")
+        .args(["-ww", "-axo", "pid=,uid=,command="])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "ps failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let process_list = String::from_utf8_lossy(&output.stdout);
+    let pids = image_capture_daemon_pids(&process_list, Uid::effective().as_raw());
+    let mut terminated = Vec::with_capacity(pids.len());
+    for pid in pids {
+        let status = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+        if status.success() {
+            terminated.push(pid);
+        }
+    }
+
+    // Wait only for the instances we stopped. launchd may create a new `icdd`,
+    // so MTPDrive must attempt its USB claim immediately after the old PIDs exit.
+    for _ in 0..15 {
+        if terminated.is_empty() {
+            break;
+        }
+        let mut any_alive = false;
+        for pid in &terminated {
+            let status = Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await?;
+            any_alive |= status.success();
+        }
+        if !any_alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    Ok(terminated.len())
+}
+
+fn image_capture_daemon_pids(process_list: &str, current_uid: u32) -> Vec<u32> {
+    process_list
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let uid = fields.next()?.parse::<u32>().ok()?;
+            let command = fields.collect::<Vec<_>>().join(" ");
+            (uid == current_uid && command == IMAGE_CAPTURE_DAEMON_PATH).then_some(pid)
+        })
+        .collect()
 }
 
 fn now_millis() -> u64 {
@@ -1414,6 +1555,18 @@ mod tests {
         assert_eq!(nonempty("Pixel", Some("USB"), "Unknown"), "Pixel");
         assert_eq!(nonempty("", Some("USB"), "Unknown"), "USB");
         assert_eq!(nonempty("", None, "Unknown"), "Unknown");
+    }
+
+    #[test]
+    fn image_capture_pid_parser_requires_the_exact_path_and_current_user() {
+        let processes = r"
+          101   501 /System/Library/Image Capture/Support/icdd
+          102   502 /System/Library/Image Capture/Support/icdd
+          103   501 /tmp/icdd
+          104   501 /System/Library/Image Capture/Support/icdd --unexpected
+        ";
+
+        assert_eq!(image_capture_daemon_pids(processes, 501), vec![101]);
     }
 
     #[test]

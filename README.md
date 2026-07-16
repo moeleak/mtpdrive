@@ -12,6 +12,28 @@ storage information, and the second page uses the library's built-in Log
 Viewer for structured service logs. Closing the window hides it; clicking the
 menu-bar icon shows the same single window again.
 
+Directory metadata is cached so Finder can reopen large camera folders without
+issuing one USB request per file. MTP object events update cached folders as
+files change on the phone; a folder accessed after 10 seconds is also validated
+in the background, with a periodic full scan as a fallback for missed events.
+Foreground reads, writes, and deletes cancel background scans so they are not
+left waiting behind a large directory refresh.
+
+## Languages
+
+The menu-bar app, device page, log page, background service messages, and CLI
+output are available in English and Simplified Chinese. MTPDrive follows the
+app-specific language selected in macOS System Settings, then the system's
+preferred language. Restart MTPDrive after changing that setting.
+
+For development or one-off CLI use, override detection with a BCP-47 language
+identifier:
+
+```sh
+MTPDRIVE_LANG=en mtpdrive status
+MTPDRIVE_LANG=zh-Hans mtpdrive devices
+```
+
 ## Current platform target
 
 - macOS 13 or newer
@@ -20,9 +42,10 @@ menu-bar icon shows the same single window again.
   compatibility range)
 
 Unlock the phone and select **File transfer / MTP** after connecting USB.
-If macOS Preview, Photos, or Image Capture already owns the phone, close that
-app and click **重新扫描**. MTP permits only one desktop process to own a device
-session; MTPDrive does not terminate macOS services automatically.
+MTPDrive automatically stops the current user's macOS Image Capture daemon
+(`icdd`) when necessary and immediately claims the MTP interface. If Preview or
+Photos is actively using the phone, close that app and click **Rescan**. MTP
+permits only one desktop process to own a device session.
 
 ## Development
 

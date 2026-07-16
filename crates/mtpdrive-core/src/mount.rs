@@ -1,6 +1,6 @@
 use crate::logs::LogStore;
 use crate::model::{LogLevel, MountState};
-use crate::{AppPaths, Error, Result};
+use crate::{AppPaths, Error, Result, current_language};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -28,13 +28,23 @@ impl MountManager {
     }
 
     pub async fn mount(&self, port: u16) -> Result<()> {
-        if self.is_mounted().await {
-            *self.state.write().await = MountState::Mounted {
-                path: self.paths.mount_point.clone(),
-                port,
-            };
+        let language = current_language();
+        let path_is_mounted = self.is_mounted().await;
+        let current_state = self.state().await;
+        if can_reuse_mount(&current_state, port, path_is_mounted) {
             return Ok(());
         }
+
+        // A daemon starts with an unmounted in-memory state. If the path is
+        // already mounted at that point, it belongs to an older daemon and its
+        // private NFS port may no longer exist. Reusing it leaves Finder stuck
+        // on grey placeholders, so replace it before mounting this server.
+        if path_is_mounted {
+            self.logs
+                .emit(LogLevel::Warn, "mount", language.replacing_stale_mount());
+            self.unmount().await?;
+        }
+
         *self.state.write().await = MountState::Mounting;
         self.paths.ensure()?;
 
@@ -64,7 +74,7 @@ impl MountManager {
             self.logs.emit(
                 LogLevel::Info,
                 "mount",
-                format!("mounted {}", self.paths.mount_point.display()),
+                language.mounted(self.paths.mount_point.display()),
             );
             Ok(())
         } else {
@@ -73,11 +83,12 @@ impl MountManager {
                 message: message.clone(),
             };
             self.logs.emit(LogLevel::Error, "mount", &message);
-            Err(Error::Operation(format!("mount_nfs failed: {message}")))
+            Err(Error::Operation(language.mount_command_failed(message)))
         }
     }
 
     pub async fn unmount(&self) -> Result<()> {
+        let language = current_language();
         if !self.is_mounted().await {
             *self.state.write().await = MountState::Unmounted;
             return Ok(());
@@ -117,14 +128,14 @@ impl MountManager {
         if result.status.success() {
             *self.state.write().await = MountState::Unmounted;
             self.logs
-                .emit(LogLevel::Info, "mount", "unmounted MTPDrive");
+                .emit(LogLevel::Info, "mount", language.unmounted_log());
             Ok(())
         } else {
             let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
             *self.state.write().await = MountState::Error {
                 message: message.clone(),
             };
-            Err(Error::Operation(format!("unmount failed: {message}")))
+            Err(Error::Operation(language.unmount_failed(message)))
         }
     }
 
@@ -136,7 +147,9 @@ impl MountManager {
                 .status()
                 .await?;
             if !status.success() {
-                return Err(Error::Operation("could not open Finder".into()));
+                return Err(Error::Operation(
+                    current_language().finder_open_failed().into(),
+                ));
             }
         }
         Ok(())
@@ -155,5 +168,44 @@ impl MountManager {
         {
             false
         }
+    }
+}
+
+fn can_reuse_mount(state: &MountState, requested_port: u16, path_is_mounted: bool) -> bool {
+    path_is_mounted
+        && matches!(
+            state,
+            MountState::Mounted { port, .. } if *port == requested_port
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_reuse_mount;
+    use crate::MountState;
+    use std::path::PathBuf;
+
+    #[test]
+    fn daemon_does_not_reuse_a_mount_it_did_not_create() {
+        assert!(!can_reuse_mount(&MountState::Unmounted, 51_896, true));
+    }
+
+    #[test]
+    fn daemon_reuses_its_live_mount_on_the_same_port() {
+        let state = MountState::Mounted {
+            path: PathBuf::from("/Users/example/MTPDrive"),
+            port: 51_896,
+        };
+        assert!(can_reuse_mount(&state, 51_896, true));
+    }
+
+    #[test]
+    fn daemon_replaces_a_mount_on_a_different_or_missing_port() {
+        let state = MountState::Mounted {
+            path: PathBuf::from("/Users/example/MTPDrive"),
+            port: 63_250,
+        };
+        assert!(!can_reuse_mount(&state, 51_896, true));
+        assert!(!can_reuse_mount(&state, 63_250, false));
     }
 }
