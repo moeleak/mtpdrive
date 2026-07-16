@@ -2370,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "mtpdrive-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "directories",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "mtpdrive-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "mtpdrive-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5303,7 +5303,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
