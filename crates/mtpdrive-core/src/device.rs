@@ -1,21 +1,27 @@
 use crate::logs::LogStore;
 use crate::model::{DeviceSummary, LogLevel, StorageSummary};
-use crate::{Error, Result};
+use crate::{Error, Result, current_language};
 use bytes::Bytes;
 use futures::stream;
+use mtp_rs::CancelToken;
 use mtp_rs::mtp::{
-    MtpDevice, MtpDeviceInfo, NewObjectInfo, ObjectHandle, ObjectInfo, Storage, StorageId,
+    DeviceEvent, Error as MtpError, MtpDevice, MtpDeviceInfo, NewObjectInfo, ObjectHandle,
+    ObjectInfo, Storage, StorageId,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::io::ReaderStream;
 
-#[derive(Debug, Clone)]
+const DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(10);
+const DIRECTORY_FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const EVENT_POLL_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectEntry {
     pub handle: u64,
     pub storage_id: u64,
@@ -43,6 +49,322 @@ impl From<ObjectInfo> for ObjectEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DirectoryCacheKey {
+    storage_id: u64,
+    parent: Option<u64>,
+}
+
+impl DirectoryCacheKey {
+    fn new(storage_id: u64, parent: Option<u64>) -> Self {
+        Self {
+            storage_id,
+            parent: parent.filter(|parent| *parent != ObjectHandle::ROOT.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedListing {
+    loaded_at: Instant,
+    fully_loaded_at: Instant,
+    entries: Vec<ObjectEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryRefresh {
+    epoch: u64,
+    cancel: CancelToken,
+}
+
+#[derive(Debug, Default)]
+struct DeviceCache {
+    listings: HashMap<DirectoryCacheKey, CachedListing>,
+    objects: HashMap<(u64, u64), ObjectEntry>,
+    refreshing: HashMap<DirectoryCacheKey, DirectoryRefresh>,
+    epoch: u64,
+}
+
+impl DeviceCache {
+    fn listing(
+        &self,
+        storage_id: u64,
+        parent: Option<u64>,
+        now: Instant,
+    ) -> Option<(Vec<ObjectEntry>, bool)> {
+        self.listings
+            .get(&DirectoryCacheKey::new(storage_id, parent))
+            .map(|cached| {
+                (
+                    cached.entries.clone(),
+                    is_cache_fresh(cached.loaded_at, now),
+                )
+            })
+    }
+
+    fn object(&self, storage_id: u64, handle: u64) -> Option<ObjectEntry> {
+        self.objects.get(&(storage_id, handle)).cloned()
+    }
+
+    fn begin_refresh(
+        &mut self,
+        storage_id: u64,
+        parent: Option<u64>,
+    ) -> Option<(u64, CancelToken)> {
+        let key = DirectoryCacheKey::new(storage_id, parent);
+        if self.refreshing.contains_key(&key) {
+            None
+        } else {
+            let cancel = CancelToken::new();
+            self.refreshing.insert(
+                key,
+                DirectoryRefresh {
+                    epoch: self.epoch,
+                    cancel: cancel.clone(),
+                },
+            );
+            Some((self.epoch, cancel))
+        }
+    }
+
+    fn refresh_is_current(&self, storage_id: u64, parent: Option<u64>, epoch: u64) -> bool {
+        self.epoch == epoch
+            && self
+                .refreshing
+                .get(&DirectoryCacheKey::new(storage_id, parent))
+                .is_some_and(|refresh| refresh.epoch == epoch && !refresh.cancel.is_cancelled())
+    }
+
+    fn finish_refresh(
+        &mut self,
+        storage_id: u64,
+        parent: Option<u64>,
+        epoch: u64,
+        entries: Option<Vec<ObjectEntry>>,
+        now: Instant,
+    ) -> bool {
+        let key = DirectoryCacheKey::new(storage_id, parent);
+        let is_current = self.epoch == epoch
+            && self
+                .refreshing
+                .get(&key)
+                .is_some_and(|refresh| refresh.epoch == epoch && !refresh.cancel.is_cancelled());
+        if !is_current {
+            return false;
+        }
+        self.refreshing.remove(&key);
+        let Some(entries) = entries else {
+            return false;
+        };
+        let changed = self
+            .listings
+            .get(&key)
+            .is_none_or(|cached| cached.entries != entries);
+        self.store_listing_inner(key, entries, now);
+        changed
+    }
+
+    fn can_count_validate(
+        &self,
+        storage_id: u64,
+        parent: Option<u64>,
+        epoch: u64,
+        object_count: usize,
+        now: Instant,
+    ) -> bool {
+        self.refresh_is_current(storage_id, parent, epoch)
+            && self
+                .listings
+                .get(&DirectoryCacheKey::new(storage_id, parent))
+                .is_some_and(|cached| {
+                    cached.entries.len() == object_count
+                        && now.saturating_duration_since(cached.fully_loaded_at)
+                            < DIRECTORY_FULL_REFRESH_INTERVAL
+                })
+    }
+
+    fn finish_count_validation(
+        &mut self,
+        storage_id: u64,
+        parent: Option<u64>,
+        epoch: u64,
+        now: Instant,
+    ) -> bool {
+        let key = DirectoryCacheKey::new(storage_id, parent);
+        if !self.refresh_is_current(storage_id, parent, epoch) {
+            return false;
+        }
+        self.refreshing.remove(&key);
+        if let Some(cached) = self.listings.get_mut(&key) {
+            cached.loaded_at = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn store_listing(
+        &mut self,
+        storage_id: u64,
+        parent: Option<u64>,
+        entries: Vec<ObjectEntry>,
+        now: Instant,
+    ) {
+        let key = DirectoryCacheKey::new(storage_id, parent);
+        self.cancel_refresh(key);
+        self.store_listing_inner(key, entries, now);
+    }
+
+    fn store_listing_inner(
+        &mut self,
+        key: DirectoryCacheKey,
+        entries: Vec<ObjectEntry>,
+        now: Instant,
+    ) {
+        let current_handles: HashSet<u64> = entries.iter().map(|entry| entry.handle).collect();
+        if let Some(previous) = self.listings.remove(&key) {
+            for entry in previous.entries {
+                if !current_handles.contains(&entry.handle) {
+                    self.objects.remove(&(key.storage_id, entry.handle));
+                }
+            }
+        }
+        for entry in &entries {
+            self.objects
+                .insert((key.storage_id, entry.handle), entry.clone());
+        }
+        self.listings.insert(
+            key,
+            CachedListing {
+                loaded_at: now,
+                fully_loaded_at: now,
+                entries,
+            },
+        );
+    }
+
+    fn store_object(&mut self, entry: ObjectEntry, now: Instant) {
+        self.upsert_object(entry, now);
+    }
+
+    fn upsert_object(&mut self, entry: ObjectEntry, now: Instant) {
+        self.cancel_refreshes();
+        let storage_id = entry.storage_id;
+        let handle = entry.handle;
+        self.objects
+            .retain(|(_, cached_handle), _| *cached_handle != handle);
+        for (key, listing) in &mut self.listings {
+            if key.storage_id == storage_id {
+                let previous_len = listing.entries.len();
+                listing.entries.retain(|cached| cached.handle != handle);
+                if listing.entries.len() != previous_len {
+                    listing.loaded_at = now;
+                    listing.fully_loaded_at = now;
+                }
+            }
+        }
+        if let Some(listing) = self.listings.get_mut(&DirectoryCacheKey::new(
+            storage_id,
+            (entry.parent != 0).then_some(entry.parent),
+        )) {
+            listing.entries.push(entry.clone());
+            listing.loaded_at = now;
+            listing.fully_loaded_at = now;
+        }
+        self.objects.insert((storage_id, handle), entry);
+    }
+
+    fn invalidate_directory(&mut self, storage_id: u64, parent: Option<u64>) {
+        let key = DirectoryCacheKey::new(storage_id, parent);
+        self.cancel_refresh(key);
+        self.listings.remove(&key);
+    }
+
+    fn invalidate_object(&mut self, storage_id: u64, handle: u64) {
+        self.cancel_refreshes();
+        let mut pending = vec![handle];
+        while let Some(current) = pending.pop() {
+            self.objects.remove(&(storage_id, current));
+            if let Some(children) = self
+                .listings
+                .remove(&DirectoryCacheKey::new(storage_id, Some(current)))
+            {
+                pending.extend(children.entries.into_iter().map(|entry| entry.handle));
+            }
+            self.listings.retain(|key, listing| {
+                key.storage_id != storage_id
+                    || !listing.entries.iter().any(|entry| entry.handle == current)
+            });
+        }
+    }
+
+    fn remove_object(&mut self, storage_id: u64, handle: u64, now: Instant) {
+        self.cancel_refreshes();
+        let mut pending = vec![handle];
+        while let Some(current) = pending.pop() {
+            self.objects.remove(&(storage_id, current));
+            if let Some(children) = self
+                .listings
+                .remove(&DirectoryCacheKey::new(storage_id, Some(current)))
+            {
+                pending.extend(children.entries.into_iter().map(|entry| entry.handle));
+            }
+            for (key, listing) in &mut self.listings {
+                if key.storage_id == storage_id {
+                    let previous_len = listing.entries.len();
+                    listing.entries.retain(|entry| entry.handle != current);
+                    if listing.entries.len() != previous_len {
+                        listing.loaded_at = now;
+                        listing.fully_loaded_at = now;
+                    }
+                }
+            }
+        }
+    }
+
+    fn remove_handle(&mut self, handle: u64, now: Instant) {
+        let mut storage_ids: HashSet<u64> = self
+            .objects
+            .keys()
+            .filter_map(|(storage_id, cached_handle)| {
+                (*cached_handle == handle).then_some(*storage_id)
+            })
+            .collect();
+        for (key, listing) in &self.listings {
+            if listing.entries.iter().any(|entry| entry.handle == handle) {
+                storage_ids.insert(key.storage_id);
+            }
+        }
+        for storage_id in storage_ids {
+            self.remove_object(storage_id, handle, now);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.cancel_refreshes();
+        self.listings.clear();
+        self.objects.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    fn cancel_refresh(&mut self, key: DirectoryCacheKey) {
+        if let Some(refresh) = self.refreshing.remove(&key) {
+            refresh.cancel.cancel();
+        }
+    }
+
+    fn cancel_refreshes(&mut self) {
+        for refresh in self.refreshing.values() {
+            refresh.cancel.cancel();
+        }
+        self.refreshing.clear();
+    }
+}
+
+fn is_cache_fresh(loaded_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(loaded_at) <= DIRECTORY_CACHE_TTL
+}
+
 struct ConnectedDevice {
     key: String,
     physical_key: String,
@@ -50,6 +372,8 @@ struct ConnectedDevice {
     device: MtpDevice,
     gate: Semaphore,
     summary: RwLock<DeviceSummary>,
+    storages: RwLock<HashMap<u64, Arc<Storage>>>,
+    cache: RwLock<DeviceCache>,
 }
 
 impl ConnectedDevice {
@@ -69,8 +393,203 @@ impl ConnectedDevice {
             .collect();
         summary.writable = summary.storages.iter().any(|storage| storage.writable)
             && self.device.supports_upload();
+        let storage_cache = storages
+            .into_iter()
+            .map(|storage| (storage.id().0, Arc::new(storage)))
+            .collect();
+        *self.storages.write().await = storage_cache;
         Ok(())
     }
+
+    async fn storage(&self, storage_id: u64) -> std::result::Result<Arc<Storage>, MtpError> {
+        if let Some(storage) = self.storages.read().await.get(&storage_id).cloned() {
+            return Ok(storage);
+        }
+        let storage = Arc::new(self.device.storage(StorageId(storage_id)).await?);
+        Ok(self
+            .storages
+            .write()
+            .await
+            .entry(storage_id)
+            .or_insert_with(|| Arc::clone(&storage))
+            .clone())
+    }
+
+    async fn cancel_background_refreshes(&self) {
+        self.cache.write().await.cancel_refreshes();
+    }
+
+    async fn object_from_event(&self, handle: u64) -> Option<ObjectEntry> {
+        let cached_storage =
+            self.cache
+                .read()
+                .await
+                .objects
+                .iter()
+                .find_map(|((storage_id, cached_handle), _)| {
+                    (*cached_handle == handle).then_some(*storage_id)
+                });
+        let mut storage_ids: Vec<u64> = self
+            .summary
+            .read()
+            .await
+            .storages
+            .iter()
+            .map(|storage| storage.id)
+            .collect();
+        if let Some(cached_storage) = cached_storage
+            && let Some(index) = storage_ids
+                .iter()
+                .position(|storage_id| *storage_id == cached_storage)
+        {
+            storage_ids.swap(0, index);
+        }
+        self.cancel_background_refreshes().await;
+        let _permit = self.gate.acquire().await.ok()?;
+        for storage_id in storage_ids {
+            let Ok(storage) = self.storage(storage_id).await else {
+                continue;
+            };
+            if let Ok(info) = storage.get_object_info(ObjectHandle(handle)).await {
+                return Some(info.into());
+            }
+        }
+        None
+    }
+
+    async fn apply_event(&self, event: DeviceEvent) -> bool {
+        match event {
+            DeviceEvent::ObjectAdded { handle } | DeviceEvent::ObjectInfoChanged { handle } => {
+                if let Some(entry) = self.object_from_event(handle.0).await {
+                    self.cache
+                        .write()
+                        .await
+                        .upsert_object(entry, Instant::now());
+                } else {
+                    self.cache.write().await.clear();
+                }
+                true
+            }
+            DeviceEvent::ObjectRemoved { handle } => {
+                self.cache
+                    .write()
+                    .await
+                    .remove_handle(handle.0, Instant::now());
+                true
+            }
+            DeviceEvent::StoreAdded { .. }
+            | DeviceEvent::StoreRemoved { .. }
+            | DeviceEvent::DeviceInfoChanged
+            | DeviceEvent::DeviceReset => {
+                self.cache.write().await.clear();
+                true
+            }
+            DeviceEvent::StorageInfoChanged { .. } | DeviceEvent::Unknown { .. } => false,
+        }
+    }
+}
+
+fn spawn_device_event_listener(device: &Arc<ConnectedDevice>, last_change_millis: Arc<AtomicU64>) {
+    let device = Arc::downgrade(device);
+    tokio::spawn(async move {
+        loop {
+            let Some(connected) = device.upgrade() else {
+                break;
+            };
+            let mtp = connected.device.clone();
+            drop(connected);
+            match tokio::time::timeout(EVENT_POLL_TIMEOUT, mtp.next_event()).await {
+                Ok(Ok(event)) => {
+                    let Some(connected) = device.upgrade() else {
+                        break;
+                    };
+                    if connected.apply_event(event).await {
+                        mark_timestamp_changed(&last_change_millis);
+                    }
+                }
+                Ok(Err(MtpError::Timeout)) | Err(_) => {}
+                Ok(Err(MtpError::Disconnected | MtpError::NoDevice)) => break,
+                Ok(Err(_)) => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+    });
+}
+
+fn spawn_directory_refresh(
+    device: Arc<ConnectedDevice>,
+    storage_id: u64,
+    parent: Option<u64>,
+    epoch: u64,
+    cancel: CancelToken,
+    last_change_millis: Arc<AtomicU64>,
+) {
+    tokio::spawn(async move {
+        let Ok(_permit) = device.gate.acquire().await else {
+            return;
+        };
+        if !device
+            .cache
+            .read()
+            .await
+            .refresh_is_current(storage_id, parent, epoch)
+        {
+            return;
+        }
+        let entries = match device.storage(storage_id).await {
+            Ok(storage) => {
+                match storage
+                    .list_objects_stream_with_cancel(parent.map(ObjectHandle), Some(&cancel))
+                    .await
+                {
+                    Ok(mut listing) => {
+                        let now = Instant::now();
+                        // Creating the stream has already fetched the handle count but not each
+                        // object's metadata. Events keep names and metadata current, so an equal
+                        // count is a cheap validation between periodic full scans.
+                        let count_is_enough = device.cache.read().await.can_count_validate(
+                            storage_id,
+                            parent,
+                            epoch,
+                            listing.total(),
+                            now,
+                        );
+                        if count_is_enough {
+                            device
+                                .cache
+                                .write()
+                                .await
+                                .finish_count_validation(storage_id, parent, epoch, now);
+                            return;
+                        }
+                        let mut entries = Vec::with_capacity(listing.total());
+                        let mut failed = false;
+                        while let Some(result) = listing.next().await {
+                            match result {
+                                Ok(object) => entries.push(object.into()),
+                                Err(_) => {
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        (!failed).then_some(entries)
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        };
+        let changed = device.cache.write().await.finish_refresh(
+            storage_id,
+            parent,
+            epoch,
+            entries,
+            Instant::now(),
+        );
+        if changed {
+            mark_timestamp_changed(&last_change_millis);
+        }
+    });
 }
 
 /// Owns all open MTP sessions and serializes operations per physical device.
@@ -111,11 +630,10 @@ impl DeviceManager {
 
     /// Enumerates USB devices, opens new sessions, and removes disconnected sessions.
     pub async fn refresh(&self) -> Result<Vec<DeviceSummary>> {
+        let language = current_language();
         let candidates = tokio::task::spawn_blocking(MtpDevice::list_devices)
             .await
-            .map_err(|error| {
-                Error::Operation(format!("device enumeration task failed: {error}"))
-            })??;
+            .map_err(|error| Error::Operation(language.device_enumeration_failed(error)))??;
         let mut unique = HashMap::<String, MtpDeviceInfo>::new();
         for candidate in candidates {
             let physical_key = physical_device_key(&candidate);
@@ -149,7 +667,7 @@ impl DeviceManager {
                 self.logs.emit(
                     LogLevel::Info,
                     "mtp",
-                    format!("device disconnected: {}", device.key),
+                    language.device_disconnected(&device.key),
                 );
             }
         }
@@ -172,13 +690,14 @@ impl DeviceManager {
                     self.logs.emit(
                         LogLevel::Info,
                         "mtp",
-                        format!(
-                            "connected to {} {}",
-                            connected.summary.read().await.manufacturer,
-                            connected.summary.read().await.model
+                        language.device_connected(
+                            &connected.summary.read().await.manufacturer,
+                            &connected.summary.read().await.model,
                         ),
                     );
-                    self.devices.write().await.insert(key, Arc::new(connected));
+                    let connected = Arc::new(connected);
+                    spawn_device_event_listener(&connected, Arc::clone(&self.last_change_millis));
+                    self.devices.write().await.insert(key, connected);
                     self.mark_changed();
                 }
                 Err(error) => {
@@ -207,6 +726,7 @@ impl DeviceManager {
     }
 
     pub async fn refresh_storage_info(&self) {
+        let language = current_language();
         let devices: Vec<Arc<ConnectedDevice>> =
             self.devices.read().await.values().cloned().collect();
         for device in devices {
@@ -214,10 +734,8 @@ impl DeviceManager {
                 self.logs.emit(
                     LogLevel::Warn,
                     "mtp",
-                    format!("failed to refresh storage for {}: {error}", device.key),
+                    language.storage_refresh_failed(&device.key, error),
                 );
-            } else {
-                self.mark_changed();
             }
         }
     }
@@ -247,14 +765,23 @@ impl DeviceManager {
         self.last_error.read().await.clone()
     }
 
+    /// Drops cached object metadata after an explicit user refresh.
+    pub async fn invalidate_caches(&self) {
+        let devices: Vec<Arc<ConnectedDevice>> =
+            self.devices.read().await.values().cloned().collect();
+        for device in devices {
+            device.cache.write().await.clear();
+        }
+        self.mark_changed();
+    }
+
     #[must_use]
     pub fn last_change(&self) -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(self.last_change_millis.load(Ordering::Acquire))
     }
 
     fn mark_changed(&self) {
-        let now = now_millis();
-        self.last_change_millis.fetch_max(now, Ordering::Release);
+        mark_timestamp_changed(&self.last_change_millis);
     }
 
     pub async fn list(
@@ -264,19 +791,59 @@ impl DeviceManager {
         parent: Option<u64>,
     ) -> Result<Vec<ObjectEntry>> {
         let device = self.get(device_key).await?;
+        let (cached, refresh_epoch) = {
+            let mut cache = device.cache.write().await;
+            match cache.listing(storage_id, parent, Instant::now()) {
+                Some((entries, true)) => (Some(entries), None),
+                Some((entries, false)) => {
+                    let epoch = cache.begin_refresh(storage_id, parent);
+                    (Some(entries), epoch)
+                }
+                None => (None, None),
+            }
+        };
+        if let Some((epoch, cancel)) = refresh_epoch {
+            spawn_directory_refresh(
+                Arc::clone(&device),
+                storage_id,
+                parent,
+                epoch,
+                cancel,
+                Arc::clone(&self.last_change_millis),
+            );
+        }
+        if let Some(entries) = cached {
+            return Ok(entries);
+        }
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
-        let parent = parent.map(ObjectHandle);
-        Ok(storage
-            .list_objects(parent)
+        if let Some((entries, _)) =
+            device
+                .cache
+                .read()
+                .await
+                .listing(storage_id, parent, Instant::now())
+        {
+            return Ok(entries);
+        }
+        let storage = device.storage(storage_id).await?;
+        let entries: Vec<ObjectEntry> = storage
+            .list_objects(parent.map(ObjectHandle))
             .await?
             .into_iter()
             .map(Into::into)
-            .collect())
+            .collect();
+        device.cache.write().await.store_listing(
+            storage_id,
+            parent,
+            entries.clone(),
+            Instant::now(),
+        );
+        Ok(entries)
     }
 
     pub async fn metadata(
@@ -286,13 +853,26 @@ impl DeviceManager {
         handle: u64,
     ) -> Result<ObjectEntry> {
         let device = self.get(device_key).await?;
+        if let Some(entry) = device.cache.read().await.object(storage_id, handle) {
+            return Ok(entry);
+        }
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
-        Ok(storage.get_object_info(ObjectHandle(handle)).await?.into())
+        if let Some(entry) = device.cache.read().await.object(storage_id, handle) {
+            return Ok(entry);
+        }
+        let storage = device.storage(storage_id).await?;
+        let entry: ObjectEntry = storage.get_object_info(ObjectHandle(handle)).await?.into();
+        device
+            .cache
+            .write()
+            .await
+            .store_object(entry.clone(), Instant::now());
+        Ok(entry)
     }
 
     pub async fn read(
@@ -304,12 +884,13 @@ impl DeviceManager {
         count: u32,
     ) -> Result<Bytes> {
         let device = self.get(device_key).await?;
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
+        let storage = device.storage(storage_id).await?;
         Ok(Bytes::from(
             storage
                 .read_range(ObjectHandle(handle), offset, count)
@@ -325,12 +906,13 @@ impl DeviceManager {
         path: &Path,
     ) -> Result<()> {
         let device = self.get(device_key).await?;
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
+        let storage = device.storage(storage_id).await?;
         let mut download = storage
             .download_windowed_default(ObjectHandle(handle))
             .await?;
@@ -352,34 +934,54 @@ impl DeviceManager {
         name: &str,
     ) -> Result<u64> {
         let device = self.get(device_key).await?;
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
+        let storage = device.storage(storage_id).await?;
         let listing_parent = parent.map(ObjectHandle);
         let handle = storage
             .create_folder(mtp_write_parent(parent), name)
             .await?;
-        Ok(storage
-            .list_objects(listing_parent)
+        let Ok(objects) = storage.list_objects(listing_parent).await else {
+            device
+                .cache
+                .write()
+                .await
+                .invalidate_directory(storage_id, parent);
+            self.mark_changed();
+            return Ok(handle.0);
+        };
+        let canonical =
+            find_uploaded_object(&objects, name, 0, Some(handle), Some(true)).unwrap_or(handle);
+        let entries = objects.into_iter().map(Into::into).collect();
+        device
+            .cache
+            .write()
             .await
-            .ok()
-            .and_then(|objects| find_uploaded_object(&objects, name, 0, Some(handle), Some(true)))
-            .unwrap_or(handle)
-            .0)
+            .store_listing(storage_id, parent, entries, Instant::now());
+        self.mark_changed();
+        Ok(canonical.0)
     }
 
     pub async fn delete(&self, device_key: &str, storage_id: u64, handle: u64) -> Result<()> {
         let device = self.get(device_key).await?;
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
+        let storage = device.storage(storage_id).await?;
         storage.delete(ObjectHandle(handle)).await?;
+        device
+            .cache
+            .write()
+            .await
+            .remove_object(storage_id, handle, Instant::now());
+        self.mark_changed();
         Ok(())
     }
 
@@ -393,16 +995,23 @@ impl DeviceManager {
         let device = self.get(device_key).await?;
         if !device.device.capabilities().can_rename {
             return Err(Error::Unsupported(
-                "device does not advertise rename".into(),
+                current_language().strings().rename_unsupported.into(),
             ));
         }
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
+        let storage = device.storage(storage_id).await?;
         storage.rename(ObjectHandle(handle), new_name).await?;
+        device
+            .cache
+            .write()
+            .await
+            .invalidate_object(storage_id, handle);
+        self.mark_changed();
         Ok(())
     }
 
@@ -416,14 +1025,17 @@ impl DeviceManager {
     ) -> Result<()> {
         let device = self.get(device_key).await?;
         if !device.device.capabilities().can_move {
-            return Err(Error::Unsupported("device does not advertise move".into()));
+            return Err(Error::Unsupported(
+                current_language().strings().move_unsupported.into(),
+            ));
         }
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(source_storage_id)).await?;
+        let storage = device.storage(source_storage_id).await?;
         storage
             .move_object(
                 ObjectHandle(handle),
@@ -431,6 +1043,11 @@ impl DeviceManager {
                 Some(StorageId(destination_storage_id)),
             )
             .await?;
+        let mut cache = device.cache.write().await;
+        cache.invalidate_object(source_storage_id, handle);
+        cache.invalidate_directory(destination_storage_id, destination_parent);
+        drop(cache);
+        self.mark_changed();
         Ok(())
     }
 
@@ -445,15 +1062,16 @@ impl DeviceManager {
         let device = self.get(device_key).await?;
         if !device.device.capabilities().can_upload {
             return Err(Error::Unsupported(
-                "device does not advertise upload".into(),
+                current_language().strings().upload_unsupported.into(),
             ));
         }
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
+        let storage = device.storage(storage_id).await?;
         let file = tokio::fs::File::open(path).await?;
         let size = file.metadata().await?.len();
         let stream = ReaderStream::new(file);
@@ -466,7 +1084,7 @@ impl DeviceManager {
                 |_progress| ControlFlow::Continue(()),
             )
             .await;
-        match result {
+        let uploaded = match result {
             Ok(handle) => {
                 Ok(
                     canonical_uploaded_handle(&storage, listing_parent, name, size, handle)
@@ -485,14 +1103,24 @@ impl DeviceManager {
                     )
                     .await
                 {
-                    return Ok(handle.0);
+                    Ok(handle.0)
+                } else {
+                    if let Some(partial) = upload_error.partial {
+                        let _ = storage.delete(partial).await;
+                    }
+                    Err(Error::Mtp(upload_error.source))
                 }
-                if let Some(partial) = upload_error.partial {
-                    let _ = storage.delete(partial).await;
-                }
-                Err(Error::Mtp(upload_error.source))
             }
+        };
+        if uploaded.is_ok() {
+            device
+                .cache
+                .write()
+                .await
+                .invalidate_directory(storage_id, parent);
+            self.mark_changed();
         }
+        uploaded
     }
 
     /// Uploads bytes, used by small sidecar-oriented tests and utilities.
@@ -505,12 +1133,13 @@ impl DeviceManager {
         data: Bytes,
     ) -> Result<u64> {
         let device = self.get(device_key).await?;
+        device.cancel_background_refreshes().await;
         let _permit = device
             .gate
             .acquire()
             .await
             .map_err(|_| Error::Disconnected)?;
-        let storage = device.device.storage(StorageId(storage_id)).await?;
+        let storage = device.storage(storage_id).await?;
         let size = data.len() as u64;
         let body = stream::iter([Ok::<Bytes, std::io::Error>(data)]);
         let listing_parent = parent.map(ObjectHandle);
@@ -521,7 +1150,7 @@ impl DeviceManager {
                 body,
             )
             .await;
-        match result {
+        let uploaded = match result {
             Ok(handle) => {
                 Ok(
                     canonical_uploaded_handle(&storage, listing_parent, name, size, handle)
@@ -540,14 +1169,24 @@ impl DeviceManager {
                     )
                     .await
                 {
-                    return Ok(handle.0);
+                    Ok(handle.0)
+                } else {
+                    if let Some(partial) = upload_error.partial {
+                        let _ = storage.delete(partial).await;
+                    }
+                    Err(Error::Mtp(upload_error.source))
                 }
-                if let Some(partial) = upload_error.partial {
-                    let _ = storage.delete(partial).await;
-                }
-                Err(Error::Mtp(upload_error.source))
             }
+        };
+        if uploaded.is_ok() {
+            device
+                .cache
+                .write()
+                .await
+                .invalidate_directory(storage_id, parent);
+            self.mark_changed();
         }
+        uploaded
     }
 
     async fn open_candidate(
@@ -565,14 +1204,19 @@ impl DeviceManager {
         let info = device.device_info();
         let writable = storages.iter().any(|storage| storage.info().is_writable)
             && device.capabilities().can_upload;
+        let strings = current_language().strings();
         let summary = DeviceSummary {
             key: key.clone(),
             manufacturer: nonempty(
                 &info.manufacturer,
                 candidate.manufacturer.as_deref(),
-                "Unknown",
+                strings.unknown,
             ),
-            model: nonempty(&info.model, candidate.product.as_deref(), "MTP device"),
+            model: nonempty(
+                &info.model,
+                candidate.product.as_deref(),
+                strings.mtp_device,
+            ),
             serial: nonempty(
                 &info.serial_number,
                 candidate.serial_number.as_deref(),
@@ -593,6 +1237,10 @@ impl DeviceManager {
                 })
                 .collect(),
         };
+        let storages = storages
+            .into_iter()
+            .map(|storage| (storage.id().0, Arc::new(storage)))
+            .collect();
         Ok(ConnectedDevice {
             key,
             physical_key: physical_device_key(candidate),
@@ -600,6 +1248,8 @@ impl DeviceManager {
             device,
             gate: Semaphore::new(1),
             summary: RwLock::new(summary),
+            storages: RwLock::new(storages),
+            cache: RwLock::new(DeviceCache::default()),
         })
     }
 
@@ -650,13 +1300,12 @@ fn candidate_matches_connected(candidate: &MtpDeviceInfo, connected: &ConnectedD
 }
 
 fn open_error_message(key: &str, error: &Error) -> String {
+    let language = current_language();
     let detail = error.to_string();
     if detail.contains("held exclusively by another process") {
-        format!(
-            "无法打开 Android 设备 {key}：它正被另一个程序独占。请关闭“预览”、“照片”或“图像捕捉”等正在访问手机的程序，重新连接 USB，并在手机上选择“文件传输 / Android Auto”。"
-        )
+        language.device_exclusively_held(key)
     } else {
-        format!("无法打开 Android 设备 {key}：{detail}")
+        language.open_device_failed(key, detail)
     }
 }
 
@@ -666,6 +1315,13 @@ fn now_millis() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn mark_timestamp_changed(timestamp: &AtomicU64) {
+    let now = now_millis();
+    let _ = timestamp.fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+        Some(now.max(previous.saturating_add(1)))
+    });
 }
 
 fn nonempty(primary: &str, secondary: Option<&str>, fallback: &str) -> String {
@@ -680,7 +1336,7 @@ fn nonempty(primary: &str, secondary: Option<&str>, fallback: &str) -> String {
 
 fn storage_name(description: &str, id: u64) -> String {
     if description.trim().is_empty() {
-        format!("Storage {id:08x}")
+        format!("{} {id:08x}", current_language().strings().storage)
     } else {
         description.to_owned()
     }
@@ -767,5 +1423,183 @@ mod tests {
         assert_eq!(normalize_parent(42), 42);
         assert_eq!(mtp_write_parent(None), Some(ObjectHandle::ALL));
         assert_eq!(mtp_write_parent(Some(42)), Some(ObjectHandle(42)));
+    }
+
+    fn cached_entry(handle: u64, parent: u64, name: &str, is_dir: bool) -> ObjectEntry {
+        ObjectEntry {
+            handle,
+            storage_id: 7,
+            parent,
+            name: name.to_owned(),
+            size: 0,
+            is_dir,
+            created: None,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn directory_listing_populates_metadata_cache() {
+        let now = Instant::now();
+        let mut cache = DeviceCache::default();
+        let entries = vec![
+            cached_entry(11, 0, "folder", true),
+            cached_entry(12, 0, "photo.jpg", false),
+        ];
+        cache.store_listing(7, None, entries.clone(), now);
+
+        assert_eq!(
+            cache
+                .listing(7, None, now)
+                .expect("cached directory")
+                .0
+                .len(),
+            2
+        );
+        assert_eq!(
+            cache.object(7, 12).expect("cached object").name,
+            "photo.jpg"
+        );
+    }
+
+    #[test]
+    fn deleting_an_object_updates_its_directory_and_keeps_sibling_metadata() {
+        let now = Instant::now();
+        let mut cache = DeviceCache::default();
+        cache.store_listing(
+            7,
+            None,
+            vec![
+                cached_entry(11, 0, "folder", true),
+                cached_entry(12, 0, "photo.jpg", false),
+            ],
+            now,
+        );
+        cache.store_listing(
+            7,
+            Some(11),
+            vec![cached_entry(13, 11, "child.txt", false)],
+            now,
+        );
+
+        cache.remove_object(7, 11, now);
+
+        assert_eq!(
+            cache.listing(7, None, now).expect("cached parent").0,
+            vec![cached_entry(12, 0, "photo.jpg", false)]
+        );
+        assert!(cache.listing(7, Some(11), now).is_none());
+        assert!(cache.object(7, 11).is_none());
+        assert!(cache.object(7, 13).is_none());
+        assert!(cache.object(7, 12).is_some());
+    }
+
+    #[test]
+    fn stale_directory_is_returned_while_one_refresh_runs() {
+        let now = Instant::now();
+        let loaded_at = now - DIRECTORY_CACHE_TTL - Duration::from_millis(1);
+        let mut cache = DeviceCache::default();
+        cache.store_listing(
+            7,
+            None,
+            vec![cached_entry(12, 0, "photo.jpg", false)],
+            loaded_at,
+        );
+
+        let (entries, fresh) = cache.listing(7, None, now).expect("stale directory");
+        assert_eq!(entries.len(), 1);
+        assert!(!fresh);
+        let (epoch, _cancel) = cache.begin_refresh(7, None).expect("first refresh");
+        assert!(cache.begin_refresh(7, None).is_none());
+        assert!(cache.finish_refresh(
+            7,
+            None,
+            epoch,
+            Some(vec![cached_entry(13, 0, "new.jpg", false)]),
+            now,
+        ));
+        let (entries, fresh) = cache.listing(7, None, now).expect("fresh directory");
+        assert!(fresh);
+        assert_eq!(entries[0].name, "new.jpg");
+    }
+
+    #[test]
+    fn matching_object_count_revalidates_without_replacing_metadata() {
+        let now = Instant::now();
+        let loaded_at = now - DIRECTORY_CACHE_TTL - Duration::from_millis(1);
+        let mut cache = DeviceCache::default();
+        cache.store_listing(
+            7,
+            None,
+            vec![cached_entry(12, 0, "photo.jpg", false)],
+            loaded_at,
+        );
+        let (epoch, _cancel) = cache.begin_refresh(7, None).expect("background refresh");
+
+        assert!(cache.can_count_validate(7, None, epoch, 1, now));
+        assert!(cache.finish_count_validation(7, None, epoch, now));
+
+        let (entries, fresh) = cache.listing(7, None, now).expect("validated directory");
+        assert!(fresh);
+        assert_eq!(entries[0].name, "photo.jpg");
+    }
+
+    #[test]
+    fn count_validation_falls_back_to_full_scan_periodically() {
+        let now = Instant::now();
+        let fully_loaded_at = now - DIRECTORY_FULL_REFRESH_INTERVAL;
+        let mut cache = DeviceCache::default();
+        cache.store_listing(
+            7,
+            None,
+            vec![cached_entry(12, 0, "photo.jpg", false)],
+            fully_loaded_at,
+        );
+        let (epoch, _cancel) = cache.begin_refresh(7, None).expect("background refresh");
+
+        assert!(!cache.can_count_validate(7, None, epoch, 1, now));
+    }
+
+    #[test]
+    fn object_event_is_merged_into_a_cached_directory() {
+        let now = Instant::now();
+        let mut cache = DeviceCache::default();
+        cache.store_listing(7, None, vec![cached_entry(12, 0, "photo.jpg", false)], now);
+
+        cache.upsert_object(cached_entry(13, 0, "new.jpg", false), now);
+
+        let (entries, fresh) = cache.listing(7, None, now).expect("updated directory");
+        assert!(fresh);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.name == "new.jpg"));
+    }
+
+    #[test]
+    fn invalidation_cancels_an_in_flight_directory_refresh() {
+        let now = Instant::now();
+        let mut cache = DeviceCache::default();
+        cache.store_listing(7, None, vec![cached_entry(12, 0, "photo.jpg", false)], now);
+        let (epoch, cancel) = cache.begin_refresh(7, None).expect("background refresh");
+
+        cache.invalidate_directory(7, None);
+
+        assert!(cancel.is_cancelled());
+        assert!(!cache.finish_refresh(
+            7,
+            None,
+            epoch,
+            Some(vec![cached_entry(13, 0, "stale.jpg", false)]),
+            now,
+        ));
+        assert!(cache.listing(7, None, now).is_none());
+    }
+
+    #[test]
+    fn change_timestamp_is_strictly_monotonic() {
+        let timestamp = AtomicU64::new(u64::MAX - 2);
+
+        mark_timestamp_changed(&timestamp);
+
+        assert_eq!(timestamp.load(Ordering::Acquire), u64::MAX - 1);
     }
 }

@@ -1,4 +1,5 @@
 use crate::device::DeviceManager;
+use crate::i18n::current_language;
 use crate::logs::LogStore;
 use crate::model::LogLevel;
 use crate::{Error, Result};
@@ -145,7 +146,10 @@ impl StagingArea {
         let metadata = manager.metadata(device_key, storage_id, handle).await?;
         if metadata.is_dir {
             return Err(Error::Unsupported(
-                "cannot stage a directory as a file".into(),
+                current_language()
+                    .strings()
+                    .stage_directory_unsupported
+                    .into(),
             ));
         }
         let id = Uuid::new_v4();
@@ -268,7 +272,8 @@ impl StagingArea {
         state.dirty = true;
         state.revision = state.revision.saturating_add(1);
         state.modified = SystemTime::now();
-        u32::try_from(data.len()).map_err(|_| Error::Operation("write is too large".into()))
+        u32::try_from(data.len())
+            .map_err(|_| Error::Operation(current_language().strings().write_too_large.into()))
     }
 
     pub async fn set_len(&self, id: Uuid, size: u64) -> Result<()> {
@@ -368,7 +373,7 @@ impl StagingArea {
         self.logs.emit(
             LogLevel::Info,
             "transfer",
-            format!("uploaded {}", state.name),
+            current_language().uploaded(&state.name),
         );
         Ok(())
     }

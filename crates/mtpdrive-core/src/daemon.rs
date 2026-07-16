@@ -393,12 +393,15 @@ async fn handle_client(stream: UnixStream, shared: Arc<DaemonShared>) -> Result<
                 message: error.to_string(),
             },
         },
-        ControlRequest::Refresh => match shared.manager.refresh().await {
-            Ok(devices) => ControlResponse::Devices(devices),
-            Err(error) => ControlResponse::Error {
-                message: error.to_string(),
-            },
-        },
+        ControlRequest::Refresh => {
+            shared.manager.invalidate_caches().await;
+            match shared.manager.refresh().await {
+                Ok(devices) => ControlResponse::Devices(devices),
+                Err(error) => ControlResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         ControlRequest::Shutdown => {
             let _ = shared.shutdown.send(true);
             ControlResponse::Ok

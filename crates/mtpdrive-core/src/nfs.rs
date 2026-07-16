@@ -1,4 +1,5 @@
 use crate::device::{DeviceManager, ObjectEntry};
+use crate::i18n::current_language;
 use crate::logs::LogStore;
 use crate::model::{DeviceSummary, LogLevel, StorageSummary};
 use crate::staging::StagingArea;
@@ -412,7 +413,13 @@ impl MtpNfsFileSystem {
                     .metadata(device_key, *storage_id, *object_id)
                     .await
                     .map_err(map_error)?;
-                Ok(object_attrs(inode, &object, self.uid, self.gid))
+                Ok(object_attrs(
+                    inode,
+                    &object,
+                    self.uid,
+                    self.gid,
+                    virtual_timestamp,
+                ))
             }
             NodeHandle::Staged(id) => self.staged_attrs(inode, *id).await,
         }
@@ -541,7 +548,11 @@ impl MtpNfsFileSystem {
         }
     }
 
-    async fn remove_handle(&self, handle: NodeHandle) -> NfsFsResult<()> {
+    async fn remove_handle(
+        &self,
+        handle: NodeHandle,
+        allow_non_empty_directory: bool,
+    ) -> NfsFsResult<()> {
         match handle {
             NodeHandle::Staged(id) => self
                 .staging
@@ -565,20 +576,22 @@ impl MtpNfsFileSystem {
                         .await
                         .map_err(map_error);
                 }
-                let metadata = self
-                    .manager
-                    .metadata(&device_key, storage_id, object_id)
-                    .await
-                    .map_err(map_error)?;
-                if metadata.is_dir
-                    && !self
+                if !allow_non_empty_directory {
+                    let metadata = self
                         .manager
-                        .list(&device_key, storage_id, Some(object_id))
+                        .metadata(&device_key, storage_id, object_id)
                         .await
-                        .map_err(map_error)?
-                        .is_empty()
-                {
-                    return Err(Nfsstat3::Notempty);
+                        .map_err(map_error)?;
+                    if metadata.is_dir
+                        && !self
+                            .manager
+                            .list(&device_key, storage_id, Some(object_id))
+                            .await
+                            .map_err(map_error)?
+                            .is_empty()
+                    {
+                        return Err(Nfsstat3::Notempty);
+                    }
                 }
                 self.manager
                     .delete(&device_key, storage_id, object_id)
@@ -771,8 +784,11 @@ impl MtpNfsFileSystem {
 
     async fn commit_handle(&self, handle: &NodeHandle) -> NfsFsResult<()> {
         if let Some(id) = self.staged_id(handle).await {
-            self.logs
-                .emit(LogLevel::Debug, "nfs", "committing staged file");
+            self.logs.emit(
+                LogLevel::Debug,
+                "nfs",
+                current_language().committing_staged_file(),
+            );
             self.staging
                 .commit(id, &self.manager)
                 .await
@@ -795,7 +811,7 @@ impl MtpNfsFileSystem {
                 logs.emit(
                     LogLevel::Warn,
                     "transfer",
-                    format!("后台提交暂存文件失败：{error}"),
+                    current_language().background_commit_failed(error),
                 );
             }
         });
@@ -1143,7 +1159,7 @@ impl Nfs3Filesystem for MtpNfsFileSystem {
             if self.is_directory(&child).await? {
                 return Err(Nfsstat3::Isdir);
             }
-            self.remove_handle(child).await?;
+            self.remove_handle(child, true).await?;
             let parent_attrs = self.attrs(&parent).await.ok();
             encode_remove_ok(w, parent_attrs.as_ref());
             Ok(())
@@ -1166,7 +1182,9 @@ impl Nfs3Filesystem for MtpNfsFileSystem {
             if !self.is_directory(&child).await? {
                 return Err(Nfsstat3::Notdir);
             }
-            self.remove_handle(child).await?;
+            // Android handles folder deletion recursively in one MTP DeleteObject request.
+            // Avoid enumerating every descendant and forcing Finder to delete them one by one.
+            self.remove_handle(child, true).await?;
             let parent_attrs = self.attrs(&parent).await.ok();
             encode_remove_ok(w, parent_attrs.as_ref());
             Ok(())
@@ -1201,7 +1219,7 @@ impl Nfs3Filesystem for MtpNfsFileSystem {
                 .await
             {
                 if existing != source {
-                    self.remove_handle(existing).await?;
+                    self.remove_handle(existing, false).await?;
                 }
             }
             self.rename_handle(
@@ -1393,7 +1411,13 @@ fn directory_attrs(fileid: u64, uid: u32, gid: u32, timestamp: Nfstime3) -> Fatt
     }
 }
 
-fn object_attrs(fileid: u64, object: &ObjectEntry, uid: u32, gid: u32) -> Fattr3 {
+fn object_attrs(
+    fileid: u64,
+    object: &ObjectEntry,
+    uid: u32,
+    gid: u32,
+    directory_timestamp: Nfstime3,
+) -> Fattr3 {
     let created = object
         .created
         .and_then(timestamp_from_mtp)
@@ -1402,6 +1426,15 @@ fn object_attrs(fileid: u64, object: &ObjectEntry, uid: u32, gid: u32) -> Fattr3
         .modified
         .and_then(timestamp_from_mtp)
         .unwrap_or(created);
+    let (atime, mtime, ctime) = if object.is_dir {
+        (
+            directory_timestamp,
+            directory_timestamp,
+            directory_timestamp,
+        )
+    } else {
+        (modified, modified, created)
+    };
     Fattr3 {
         ftype: if object.is_dir {
             Ftype3::Dir
@@ -1417,9 +1450,9 @@ fn object_attrs(fileid: u64, object: &ObjectEntry, uid: u32, gid: u32) -> Fattr3
         rdev: Specdata3::default(),
         fsid: NFS_FSID,
         fileid,
-        atime: modified,
-        mtime: modified,
-        ctime: created,
+        atime,
+        mtime,
+        ctime,
     }
 }
 
@@ -1469,7 +1502,7 @@ fn safe_component(value: &str) -> String {
         .collect();
     let cleaned = cleaned.trim();
     if cleaned.is_empty() {
-        "MTP device".to_owned()
+        current_language().strings().mtp_device.to_owned()
     } else {
         cleaned.to_owned()
     }
