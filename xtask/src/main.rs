@@ -124,6 +124,16 @@ fn build_app(root: &Path, skip_build: bool) -> Result<PathBuf> {
         root.join("THIRD_PARTY_NOTICES.md"),
         resources.join("THIRD_PARTY_NOTICES.md"),
     )?;
+    for localization in ["en.lproj", "zh-Hans.lproj"] {
+        let destination = resources.join(localization);
+        fs::create_dir_all(&destination)?;
+        fs::copy(
+            root.join("crates/mtpdrive-app/resources")
+                .join(localization)
+                .join("InfoPlist.strings"),
+            destination.join("InfoPlist.strings"),
+        )?;
+    }
 
     ad_hoc_sign(&universal_cli)?;
     ad_hoc_sign(&universal_gui)?;

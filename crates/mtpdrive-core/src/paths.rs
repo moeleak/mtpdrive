@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::{Error, Result, current_language};
 use directories::BaseDirs;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
     pub support_dir: PathBuf,
+    pub settings_path: PathBuf,
     pub cache_dir: PathBuf,
     pub staging_dir: PathBuf,
     pub sidecar_dir: PathBuf,
@@ -22,7 +23,12 @@ impl AppPaths {
         }
 
         let base = BaseDirs::new().ok_or_else(|| {
-            Error::Operation("could not determine the current user's home directory".into())
+            Error::Operation(
+                current_language()
+                    .strings()
+                    .home_directory_unavailable
+                    .into(),
+            )
         })?;
         let home = base.home_dir();
         let support = home
@@ -32,6 +38,7 @@ impl AppPaths {
         let cache = home.join("Library").join("Caches").join("MTPDrive");
 
         Ok(Self {
+            settings_path: support.join("settings.json"),
             staging_dir: cache.join("staging"),
             sidecar_dir: support.join("sidecar"),
             log_dir: support.join("logs"),
@@ -48,6 +55,7 @@ impl AppPaths {
         let support = root.join("support");
         let cache = root.join("cache");
         Self {
+            settings_path: support.join("settings.json"),
             staging_dir: cache.join("staging"),
             sidecar_dir: support.join("sidecar"),
             log_dir: support.join("logs"),

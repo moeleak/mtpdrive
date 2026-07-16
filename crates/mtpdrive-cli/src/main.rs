@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use mtpdrive_core::{
     AppPaths, ControlRequest, ControlResponse, DaemonClient, DaemonOptions, DeviceSummary,
-    LogRecord, MtpDriveDaemon,
+    Language, LogRecord, MountState, MtpDriveDaemon, current_language,
 };
 use std::time::Duration;
 
@@ -99,18 +99,24 @@ async fn main() -> Result<()> {
 }
 
 async fn run_client_command(command: Command) -> Result<()> {
+    let language = current_language();
+    let strings = language.strings();
     let client = DaemonClient::discover()?;
     match command {
         Command::Status { json } => {
-            let snapshot = client.snapshot().await.context(service_hint())?;
+            let snapshot = client.snapshot().await.context(strings.service_hint)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
             } else {
                 println!("MTPDrive {}", snapshot.version);
-                println!("Mount: {:?}", snapshot.mount);
-                println!("Devices: {}", snapshot.devices.len());
+                println!(
+                    "{}: {}",
+                    strings.mount_label,
+                    format_mount_state(language, &snapshot.mount)
+                );
+                println!("{}: {}", strings.devices_label, snapshot.devices.len());
                 if let Some(error) = snapshot.last_error {
-                    println!("Last error: {error}");
+                    println!("{}: {error}", strings.last_error_label);
                 }
             }
         }
@@ -118,46 +124,54 @@ async fn run_client_command(command: Command) -> Result<()> {
             let response = client
                 .request(ControlRequest::Devices)
                 .await
-                .context(service_hint())?;
+                .context(strings.service_hint)?;
             let ControlResponse::Devices(devices) = response else {
-                return response_error(response);
+                return response_error(language, response);
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&devices)?);
             } else {
-                print_devices(&devices);
+                print_devices(language, &devices);
             }
         }
         Command::Logs {
             follow,
             json,
             limit,
-        } => stream_logs(&client, follow, json, limit).await?,
-        Command::Mount => expect_ok(client.request(ControlRequest::Mount).await?)?,
-        Command::Unmount => expect_ok(client.request(ControlRequest::Unmount).await?)?,
-        Command::Open => expect_ok(client.request(ControlRequest::Open).await?)?,
+        } => stream_logs(language, &client, follow, json, limit).await?,
+        Command::Mount => expect_ok(language, client.request(ControlRequest::Mount).await?)?,
+        Command::Unmount => expect_ok(language, client.request(ControlRequest::Unmount).await?)?,
+        Command::Open => expect_ok(language, client.request(ControlRequest::Open).await?)?,
         Command::Refresh => {
             let response = client.request(ControlRequest::Refresh).await?;
             let ControlResponse::Devices(devices) = response else {
-                return response_error(response);
+                return response_error(language, response);
             };
-            print_devices(&devices);
+            print_devices(language, &devices);
         }
-        Command::Shutdown => expect_ok(client.request(ControlRequest::Shutdown).await?)?,
+        Command::Shutdown => {
+            expect_ok(language, client.request(ControlRequest::Shutdown).await?)?;
+        }
         Command::Daemon { .. } => unreachable!("daemon handled before client dispatch"),
     }
     Ok(())
 }
 
-async fn stream_logs(client: &DaemonClient, follow: bool, json: bool, limit: usize) -> Result<()> {
+async fn stream_logs(
+    language: Language,
+    client: &DaemonClient,
+    follow: bool,
+    json: bool,
+    limit: usize,
+) -> Result<()> {
     let mut after = 0_u64;
     loop {
         let response = client
             .request(ControlRequest::Logs { after, limit })
             .await
-            .context(service_hint())?;
+            .context(language.strings().service_hint)?;
         let ControlResponse::Logs(records) = response else {
-            return response_error(response);
+            return response_error(language, response);
         };
         for record in &records {
             print_log(record, json)?;
@@ -171,37 +185,46 @@ async fn stream_logs(client: &DaemonClient, follow: bool, json: bool, limit: usi
     Ok(())
 }
 
-fn expect_ok(response: ControlResponse) -> Result<()> {
+fn expect_ok(language: Language, response: ControlResponse) -> Result<()> {
     match response {
         ControlResponse::Ok => Ok(()),
-        other => response_error(other),
+        other => response_error(language, other),
     }
 }
 
-fn response_error<T>(response: ControlResponse) -> Result<T> {
+fn response_error<T>(language: Language, response: ControlResponse) -> Result<T> {
     match response {
         ControlResponse::Error { message } => bail!(message),
-        other => bail!("unexpected daemon response: {other:?}"),
+        other => bail!(language.unexpected_daemon_response(other)),
     }
 }
 
-fn print_devices(devices: &[DeviceSummary]) {
+fn print_devices(language: Language, devices: &[DeviceSummary]) {
+    let strings = language.strings();
     if devices.is_empty() {
-        println!("No MTP devices connected.");
+        println!("{}", strings.no_mtp_devices);
         return;
     }
     for device in devices {
         println!(
-            "{} {}  serial={}  writable={}",
-            device.manufacturer, device.model, device.serial, device.writable
+            "{} {}  {}={}  {}={}",
+            device.manufacturer,
+            device.model,
+            strings.serial_label,
+            device.serial,
+            strings.writable_label,
+            localized_bool(language, device.writable)
         );
         for storage in &device.storages {
             println!(
-                "  {}  {} free / {}  writable={}",
+                "  {}  {}={}  {}={}  {}={}",
                 storage.name,
+                strings.free_label,
                 format_bytes(storage.free_bytes),
+                strings.total_label,
                 format_bytes(storage.total_bytes),
-                storage.writable
+                strings.writable_label,
+                localized_bool(language, storage.writable)
             );
         }
     }
@@ -234,6 +257,17 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn service_hint() -> &'static str {
-    "MTPDrive service is not running; start the app or run `mtpdrive daemon`"
+fn localized_bool(language: Language, value: bool) -> &'static str {
+    let strings = language.strings();
+    if value { strings.yes } else { strings.no }
+}
+
+fn format_mount_state(language: Language, state: &MountState) -> String {
+    let strings = language.strings();
+    match state {
+        MountState::Unmounted => strings.unmounted.to_owned(),
+        MountState::Mounting => strings.mounting.to_owned(),
+        MountState::Mounted { path, .. } => language.mounted_at(path.display()),
+        MountState::Error { message } => language.mount_failed(message),
+    }
 }

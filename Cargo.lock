@@ -2370,13 +2370,15 @@ dependencies = [
 
 [[package]]
 name = "mtpdrive-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
+ "directories",
  "iced",
  "image",
  "material-ui-rs",
  "mtpdrive-core",
+ "semver",
  "serde_json",
  "time",
  "tokio",
@@ -2385,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "mtpdrive-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2398,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "mtpdrive-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2413,7 +2415,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-util",
@@ -5302,7 +5303,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",

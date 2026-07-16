@@ -12,11 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+directories.workspace = true
 iced.workspace = true
 image.workspace = true
 material-ui-rs.workspace = true
 mtpdrive-core = { path = "../mtpdrive-core" }
 serde_json.workspace = true
+semver.workspace = true
 time.workspace = true
 tokio.workspace = true
 tray-icon.workspace = true

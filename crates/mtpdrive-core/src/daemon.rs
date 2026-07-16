@@ -1,11 +1,12 @@
 use crate::device::DeviceManager;
+use crate::i18n::{current_language, set_current_language};
 use crate::ipc::DaemonClient;
 use crate::logs::LogStore;
 use crate::model::{ControlRequest, ControlResponse, LogLevel, ServiceSnapshot};
 use crate::mount::MountManager;
 use crate::nfs::{MtpNfsFileSystem, NFS_FSID};
 use crate::staging::StagingArea;
-use crate::{AppPaths, Error, Result};
+use crate::{AppPaths, AppSettings, Error, Result};
 use fractal_nfs::NfsServerConfig;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +44,7 @@ pub struct MtpDriveDaemon {
     filesystem: MtpNfsFileSystem,
     mount: MountManager,
     snapshot: Arc<RwLock<ServiceSnapshot>>,
+    settings: Arc<RwLock<AppSettings>>,
 }
 
 impl std::fmt::Debug for MtpDriveDaemon {
@@ -58,6 +60,8 @@ impl std::fmt::Debug for MtpDriveDaemon {
 impl MtpDriveDaemon {
     pub fn new(paths: AppPaths, options: DaemonOptions) -> Result<Self> {
         paths.ensure()?;
+        let settings = AppSettings::load(&paths)?;
+        set_current_language(settings.language.resolve());
         let logs = LogStore::new(&paths.log_dir)?;
         let manager = DeviceManager::new(logs.clone());
         let staging = StagingArea::new(&paths.staging_dir, logs.clone())?;
@@ -72,23 +76,22 @@ impl MtpDriveDaemon {
             filesystem,
             mount,
             snapshot: Arc::new(RwLock::new(ServiceSnapshot::default())),
+            settings: Arc::new(RwLock::new(settings)),
         })
     }
 
     pub async fn run(self) -> Result<()> {
+        let language = current_language();
         self.ensure_single_instance().await?;
         let ipc_listener = UnixListener::bind(&self.paths.socket_path)?;
         let nfs_port = available_port(self.options.port)?;
         self.logs.emit(
             LogLevel::Info,
             "daemon",
-            format!("MTPDrive {} starting", env!("CARGO_PKG_VERSION")),
+            language.daemon_starting(env!("CARGO_PKG_VERSION")),
         );
-        self.logs.emit(
-            LogLevel::Info,
-            "nfs",
-            format!("NFSv3 listening on 127.0.0.1:{nfs_port}"),
-        );
+        self.logs
+            .emit(LogLevel::Info, "nfs", language.nfs_listening(nfs_port));
 
         let nfs_shutdown = CancellationToken::new();
         let server_shutdown = nfs_shutdown.clone();
@@ -113,9 +116,7 @@ impl MtpDriveDaemon {
                 .err()
                 .map_or_else(|| error.to_string(), |error| error.to_string());
             let _ = std::fs::remove_file(&self.paths.socket_path);
-            return Err(Error::Operation(format!(
-                "NFS server did not start: {server_error}"
-            )));
+            return Err(Error::Operation(language.nfs_start_failed(server_error)));
         }
         if !self.options.no_mount
             && let Err(error) = self.mount.mount(nfs_port).await
@@ -133,6 +134,7 @@ impl MtpDriveDaemon {
             self.logs.clone(),
             self.options.scan_interval,
             self.options.open_on_first_device && !self.options.no_mount,
+            self.settings.clone(),
             shutdown_rx.clone(),
         ));
 
@@ -143,6 +145,8 @@ impl MtpDriveDaemon {
             snapshot: self.snapshot.clone(),
             nfs_port,
             shutdown: shutdown_tx.clone(),
+            settings: self.settings.clone(),
+            paths: self.paths.clone(),
         });
 
         let mut shutdown_rx = shutdown_rx;
@@ -170,13 +174,13 @@ impl MtpDriveDaemon {
         }
 
         self.logs
-            .emit(LogLevel::Info, "daemon", "MTPDrive shutting down");
+            .emit(LogLevel::Info, "daemon", language.daemon_shutting_down());
         discovery_task.abort();
         if let Err(error) = self.filesystem.flush_dirty().await {
             self.logs.emit(
                 LogLevel::Warn,
                 "transfer",
-                format!("退出前提交暂存文件失败：{error}"),
+                language.flush_before_exit_failed(error),
             );
         }
         if !self.options.no_mount {
@@ -191,19 +195,16 @@ impl MtpDriveDaemon {
                 self.logs.emit(
                     LogLevel::Warn,
                     "nfs",
-                    format!("NFS server stopped with an error: {error}"),
+                    language.nfs_stopped_with_error(error),
                 );
             }
             Ok(Err(error)) => {
-                self.logs.emit(
-                    LogLevel::Warn,
-                    "nfs",
-                    format!("NFS server task failed: {error}"),
-                );
+                self.logs
+                    .emit(LogLevel::Warn, "nfs", language.nfs_task_failed(error));
             }
             Err(_) => {
                 self.logs
-                    .emit(LogLevel::Warn, "nfs", "NFS server shutdown timed out");
+                    .emit(LogLevel::Warn, "nfs", language.nfs_shutdown_timeout());
             }
         }
         let _ = std::fs::remove_file(&self.paths.socket_path);
@@ -215,7 +216,7 @@ impl MtpDriveDaemon {
             let client = DaemonClient::new(&self.paths.socket_path);
             if client.is_running().await {
                 return Err(Error::Operation(
-                    "MTPDrive daemon is already running".into(),
+                    current_language().daemon_already_running().into(),
                 ));
             }
             std::fs::remove_file(&self.paths.socket_path)?;
@@ -253,9 +254,9 @@ async fn wait_for_nfs(port: u16) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Err(Error::Operation(format!(
-        "timed out waiting for 127.0.0.1:{port}"
-    )))
+    Err(Error::Operation(
+        current_language().wait_for_nfs_timeout(port),
+    ))
 }
 
 struct DaemonShared {
@@ -265,6 +266,8 @@ struct DaemonShared {
     snapshot: Arc<RwLock<ServiceSnapshot>>,
     nfs_port: u16,
     shutdown: watch::Sender<bool>,
+    settings: Arc<RwLock<AppSettings>>,
+    paths: AppPaths,
 }
 
 async fn discovery_loop(
@@ -274,7 +277,8 @@ async fn discovery_loop(
     snapshot: Arc<RwLock<ServiceSnapshot>>,
     logs: LogStore,
     interval: Duration,
-    open_on_first_device: bool,
+    allow_open_on_first_device: bool,
+    settings: Arc<RwLock<AppSettings>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut previous_count = 0_usize;
@@ -301,7 +305,7 @@ async fn discovery_loop(
                 logs.emit(
                     LogLevel::Warn,
                     "mtp",
-                    format!("device scan failed: {error}"),
+                    current_language().device_scan_failed(error),
                 );
                 Vec::new()
             }
@@ -314,13 +318,17 @@ async fn discovery_loop(
             logs.emit(
                 LogLevel::Warn,
                 "transfer",
-                format!("重新连接后提交暂存文件失败：{error}"),
+                current_language().reconnect_commit_failed(error),
             );
         }
         if storage_tick.is_multiple_of(15) {
             manager.refresh_storage_info().await;
         }
-        if open_on_first_device && previous_count == 0 && !devices.is_empty() {
+        if allow_open_on_first_device
+            && settings.read().await.always_open_in_finder
+            && previous_count == 0
+            && !devices.is_empty()
+        {
             let _ = mount.open_in_finder().await;
         }
         previous_count = devices.len();
@@ -356,6 +364,17 @@ async fn handle_client(stream: UnixStream, shared: Arc<DaemonShared>) -> Result<
         ControlRequest::Logs { after, limit } => {
             ControlResponse::Logs(shared.logs.after(after, limit))
         }
+        ControlRequest::Settings => ControlResponse::Settings(*shared.settings.read().await),
+        ControlRequest::SetSettings { settings } => match settings.save(&shared.paths) {
+            Ok(()) => {
+                set_current_language(settings.language.resolve());
+                *shared.settings.write().await = settings;
+                ControlResponse::Settings(settings)
+            }
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        },
         ControlRequest::Mount => match shared.mount.mount(shared.nfs_port).await {
             Ok(()) => ControlResponse::Ok,
             Err(error) => ControlResponse::Error {

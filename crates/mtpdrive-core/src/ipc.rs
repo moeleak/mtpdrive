@@ -1,5 +1,5 @@
 use crate::model::{ControlRequest, ControlResponse, ServiceSnapshot};
-use crate::{AppPaths, Error, Result};
+use crate::{AppPaths, Error, Result, current_language};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -49,7 +49,9 @@ impl DaemonClient {
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         if reader.read_line(&mut line).await? == 0 {
-            return Err(Error::InvalidResponse("empty response".into()));
+            return Err(Error::InvalidResponse(
+                current_language().strings().empty_response.into(),
+            ));
         }
         Ok(serde_json::from_str(&line)?)
     }
@@ -65,9 +67,9 @@ impl DaemonClient {
         match self.request(ControlRequest::Snapshot).await? {
             ControlResponse::Snapshot(snapshot) => Ok(snapshot),
             ControlResponse::Error { message } => Err(Error::Operation(message)),
-            other => Err(Error::InvalidResponse(format!(
-                "expected snapshot, got {other:?}"
-            ))),
+            other => Err(Error::InvalidResponse(
+                current_language().expected_snapshot(other),
+            )),
         }
     }
 }
