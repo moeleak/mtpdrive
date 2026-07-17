@@ -2,6 +2,7 @@
 
 pub mod daemon;
 pub mod device;
+pub mod format;
 pub mod i18n;
 pub mod ipc;
 pub mod logs;
@@ -13,11 +14,12 @@ pub mod settings;
 pub mod staging;
 
 pub use daemon::{DaemonOptions, MtpDriveDaemon};
+pub use format::{format_bytes, format_mount_state};
 pub use i18n::{
     Language, Strings, current_language, detect_language_from, parse_language,
     set_current_language, system_language,
 };
-pub use ipc::DaemonClient;
+pub use ipc::{DaemonClient, DaemonRequestError, DaemonRequestResult};
 pub use model::{
     ControlRequest, ControlResponse, DeviceSummary, LogLevel, LogRecord, MountState,
     ServiceSnapshot, StorageSummary,
