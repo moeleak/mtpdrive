@@ -25,7 +25,7 @@ pub use model::{
     ServiceSnapshot, StorageSummary,
 };
 pub use paths::AppPaths;
-pub use settings::{AppSettings, LanguagePreference};
+pub use settings::{AppSettings, AppearancePreference, LanguagePreference, ThemeColor};
 
 /// `MTPDrive`'s result type.
 pub type Result<T> = std::result::Result<T, Error>;

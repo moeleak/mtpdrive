@@ -1,16 +1,18 @@
 use crate::WINDOW_SIZE;
 use crate::instance;
+use crate::login_item;
 use crate::service;
+use crate::theme;
 use crate::tray::{Tray, TrayAction};
 use crate::updater::{self, DownloadEvent, ReleaseAsset, ReleaseCheck};
-use crate::views::{destinations, language_options};
+use crate::views::{appearance_options, destinations, language_options};
 use iced::time::Instant;
-use iced::{Size, Subscription, Task};
-use material::widget::{log_viewer, navigation, progress_bar};
+use iced::{Point, Size, Subscription, Task};
+use material::widget::{log_viewer, navigation, progress_bar, theme_picker};
 use material_ui_rs as material;
 use mtpdrive_core::{
-    AppPaths, AppSettings, ControlRequest, ControlResponse, Language, LanguagePreference,
-    LogRecord, ServiceSnapshot, set_current_language,
+    AppPaths, AppSettings, AppearancePreference, ControlRequest, ControlResponse, Language,
+    LanguagePreference, LogRecord, ServiceSnapshot, set_current_language,
 };
 use std::fmt;
 use std::path::PathBuf;
@@ -33,7 +35,12 @@ pub(crate) enum Message {
     OpenFinder,
     RefreshDevices,
     AlwaysOpenChanged(bool),
+    OpenAtLoginChanged(bool),
+    OpenLoginItemsSettings,
     LanguageChanged(LanguagePreference),
+    AppearanceChanged(AppearancePreference),
+    ThemeChanged(theme_picker::ThemeAction),
+    SystemThemeChanged(iced::theme::Mode),
     CheckForUpdates,
     UpdateChecked(Result<ReleaseCheck, String>),
     DownloadUpdate {
@@ -69,6 +76,18 @@ impl fmt::Display for LanguageOption {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppearanceOption {
+    pub(crate) preference: AppearancePreference,
+    pub(crate) label: &'static str,
+}
+
+impl fmt::Display for AppearanceOption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) enum UpdateState {
     #[default]
@@ -97,6 +116,7 @@ pub(crate) struct App {
     pub(crate) language: Language,
     pub(crate) settings: AppSettings,
     pub(crate) language_options: [LanguageOption; 3],
+    pub(crate) appearance_options: [AppearanceOption; 3],
     pub(crate) update_state: UpdateState,
     pub(crate) destinations: [navigation::Destination<Page>; 3],
     pub(crate) navigation: navigation::NavigationState<Page>,
@@ -105,6 +125,10 @@ pub(crate) struct App {
     pub(crate) log_entries: Vec<log_viewer::LogEntry<u64>>,
     pub(crate) log_viewer: log_viewer::State<u64>,
     pub(crate) progress_animation: progress_bar::IndeterminateState,
+    pub(crate) theme_controller: theme_picker::ThemeController,
+    pub(crate) login_item_status: login_item::Status,
+    pub(crate) login_item_error: Option<String>,
+    system_theme: iced::theme::Mode,
     last_log_id: u64,
     pub(crate) error: Option<String>,
     service_ready: bool,
@@ -119,6 +143,7 @@ pub(crate) fn boot() -> (App, Task<Message>) {
             Err(error) => (AppSettings::default(), Some(error)),
         };
     let language = settings.language.resolve();
+    let system_theme = iced::theme::Mode::None;
     set_current_language(language);
     let (tray, tray_error) = match Tray::new(language) {
         Ok(tray) => (Some(tray), None),
@@ -128,6 +153,7 @@ pub(crate) fn boot() -> (App, Task<Message>) {
         language,
         settings,
         language_options: language_options(language),
+        appearance_options: appearance_options(language),
         update_state: UpdateState::default(),
         destinations: destinations(language),
         navigation: navigation::NavigationState::new(Page::Devices),
@@ -137,6 +163,13 @@ pub(crate) fn boot() -> (App, Task<Message>) {
         log_entries: Vec::new(),
         log_viewer: log_viewer::State::new(),
         progress_animation: progress_bar::IndeterminateState::new(Instant::now()),
+        theme_controller: theme_picker::ThemeController::new(
+            theme::material_color(settings.theme_color),
+            theme::effective_dark(settings.appearance, system_theme),
+        ),
+        login_item_status: login_item::status(),
+        login_item_error: None,
+        system_theme,
         last_log_id: 0,
         error: settings_error.map(|error| error.to_string()).or(tray_error),
         service_ready: false,
@@ -144,7 +177,10 @@ pub(crate) fn boot() -> (App, Task<Message>) {
     };
     (
         app,
-        Task::perform(service::ensure_daemon(language), Message::DaemonReady),
+        Task::batch([
+            Task::perform(service::ensure_daemon(language), Message::DaemonReady),
+            iced::system::theme().map(Message::SystemThemeChanged),
+        ]),
     )
 }
 
@@ -168,6 +204,7 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::CloseRequested(id) => iced::window::set_mode(id, iced::window::Mode::Hidden),
         Message::Frame(now) => {
+            let _ = app.theme_controller.advance(now);
             let _ = app.navigation.advance(now);
             let _ = app.log_viewer.advance(now);
             app.progress_animation.advance(now);
@@ -184,6 +221,9 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             refresh_task(app.last_log_id)
         }
         Message::Tick => {
+            if app.navigation.selected() == Page::Settings {
+                app.login_item_status = login_item::status();
+            }
             let mut tasks = Tray::drain_actions(app.tray.as_ref())
                 .into_iter()
                 .map(|action| Task::done(tray_message(action)))
@@ -234,6 +274,23 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
                 settings: app.settings,
             })
         }
+        Message::OpenAtLoginChanged(enabled) => {
+            match login_item::set_enabled(enabled) {
+                Ok(status) => {
+                    app.login_item_status = status;
+                    app.login_item_error = None;
+                }
+                Err(error) => {
+                    app.login_item_status = login_item::status();
+                    app.login_item_error = Some(error);
+                }
+            }
+            Task::none()
+        }
+        Message::OpenLoginItemsSettings => {
+            login_item::open_system_settings();
+            Task::none()
+        }
         Message::LanguageChanged(language_preference) => {
             app.settings.language = language_preference;
             let language = language_preference.resolve();
@@ -241,6 +298,7 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             app.language = language;
             app.destinations = destinations(language);
             app.language_options = language_options(language);
+            app.appearance_options = appearance_options(language);
             let tray_result = match app.tray.as_ref() {
                 Some(tray) => tray.set_language(language),
                 None => Tray::new(language).map(|tray| app.tray = Some(tray)),
@@ -251,6 +309,54 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             control_task(ControlRequest::SetSettings {
                 settings: app.settings,
             })
+        }
+        Message::AppearanceChanged(preference) => {
+            app.settings.appearance = preference;
+            apply_dark_mode(
+                app,
+                theme::effective_dark(preference, app.system_theme),
+                Instant::now(),
+            );
+            save_settings_task(app)
+        }
+        Message::ThemeChanged(action) => {
+            let should_save = match action {
+                theme_picker::ThemeAction::SelectColor(color) => {
+                    app.settings.theme_color = theme::persisted_color(color);
+                    true
+                }
+                theme_picker::ThemeAction::SetDarkMode { dark_mode, .. } => {
+                    app.settings.appearance = if dark_mode {
+                        AppearancePreference::Dark
+                    } else {
+                        AppearancePreference::Light
+                    };
+                    true
+                }
+                theme_picker::ThemeAction::TogglePicker => false,
+            };
+            app.theme_controller.update(
+                action,
+                app.window_size,
+                picker_bottom_margin(app),
+                Instant::now(),
+            );
+            if should_save {
+                save_settings_task(app)
+            } else {
+                Task::none()
+            }
+        }
+        Message::SystemThemeChanged(mode) => {
+            app.system_theme = mode;
+            if app.settings.appearance == AppearancePreference::System {
+                apply_dark_mode(
+                    app,
+                    theme::effective_dark(app.settings.appearance, mode),
+                    Instant::now(),
+                );
+            }
+            Task::none()
         }
         Message::CheckForUpdates => {
             app.update_state = UpdateState::Checking;
@@ -338,10 +444,10 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ShowWindow => iced::window::latest().map(Message::WindowLocated),
-        Message::WindowLocated(Some(id)) => Task::batch([
-            iced::window::set_mode(id, iced::window::Mode::Windowed),
-            iced::window::gain_focus(id),
-        ]),
+        Message::WindowLocated(Some(id)) => {
+            iced::window::set_mode(id, iced::window::Mode::Windowed)
+                .chain(iced::window::gain_focus(id))
+        }
         Message::WindowLocated(None) => Task::none(),
         Message::Quit => Task::perform(service::shutdown_daemon(), |()| Message::Exit),
         Message::Exit => iced::exit(),
@@ -353,6 +459,7 @@ pub(crate) fn subscription(app: &App) -> Subscription<Message> {
         iced::time::every(Duration::from_millis(750)).map(|_| Message::Tick),
         iced::window::resize_events().map(|(_, size)| Message::WindowResized(size)),
         iced::window::close_requests().map(Message::CloseRequested),
+        iced::system::theme_changes().map(Message::SystemThemeChanged),
     ];
     let progress_is_visible = (app.navigation.selected() == Page::Devices
         && app
@@ -368,12 +475,17 @@ pub(crate) fn subscription(app: &App) -> Subscription<Message> {
                     | UpdateState::Verifying { .. }
             ));
     if app.navigation.is_animating()
+        || app.theme_controller.is_animating()
         || app.log_viewer.is_animating()
         || (progress_is_visible && app.progress_animation.is_animating())
     {
         subscriptions.push(iced::window::frames().map(Message::Frame));
     }
     Subscription::batch(subscriptions)
+}
+
+pub(crate) fn theme(app: &App) -> material::Theme {
+    app.theme_controller.theme("MTPDrive")
 }
 
 fn tray_message(action: TrayAction) -> Message {
@@ -397,6 +509,34 @@ fn refresh_task(after: u64) -> Task<Message> {
 
 fn control_task(request: ControlRequest) -> Task<Message> {
     Task::perform(service::control(request), Message::ControlFinished)
+}
+
+fn save_settings_task(app: &App) -> Task<Message> {
+    control_task(ControlRequest::SetSettings {
+        settings: app.settings,
+    })
+}
+
+fn picker_bottom_margin(app: &App) -> f32 {
+    theme_picker::bottom_margin(navigation::adaptive_layout(
+        app.window_size.width,
+        app.window_size.height,
+    ))
+}
+
+fn apply_dark_mode(app: &mut App, dark_mode: bool, now: Instant) {
+    if app.theme_controller.dark_mode() == dark_mode {
+        return;
+    }
+    app.theme_controller.update(
+        theme_picker::ThemeAction::SetDarkMode {
+            dark_mode,
+            origin: Point::new(app.window_size.width / 2.0, app.window_size.height / 2.0),
+        },
+        app.window_size,
+        picker_bottom_margin(app),
+        now,
+    );
 }
 
 fn rebuild_log_entries(app: &mut App) {

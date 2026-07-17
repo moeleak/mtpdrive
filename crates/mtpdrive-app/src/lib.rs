@@ -2,7 +2,9 @@
 
 mod application;
 mod instance;
+mod login_item;
 mod service;
+mod theme;
 mod tray;
 mod tray_template;
 mod updater;
@@ -25,6 +27,7 @@ pub fn run() -> iced::Result {
     }
     let result = material::application(application::boot, application::update, views::view)
         .title("MTPDrive")
+        .theme(application::theme)
         .subscription(application::subscription)
         .window(window_settings())
         .exit_on_close_request(false)

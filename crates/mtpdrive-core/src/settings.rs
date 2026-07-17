@@ -23,12 +23,39 @@ impl LanguagePreference {
     }
 }
 
+/// Material color theme persisted without coupling the core crate to the UI toolkit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeColor {
+    #[default]
+    Purple,
+    Blue,
+    Teal,
+    Green,
+    Yellow,
+    Orange,
+    Red,
+    Pink,
+}
+
+/// Appearance selection persisted independently from the current system theme.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearancePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 /// User preferences shared by the app and background service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub always_open_in_finder: bool,
     pub language: LanguagePreference,
+    pub theme_color: ThemeColor,
+    pub appearance: AppearancePreference,
 }
 
 impl Default for AppSettings {
@@ -36,6 +63,8 @@ impl Default for AppSettings {
         Self {
             always_open_in_finder: true,
             language: LanguagePreference::System,
+            theme_color: ThemeColor::Purple,
+            appearance: AppearancePreference::System,
         }
     }
 }
