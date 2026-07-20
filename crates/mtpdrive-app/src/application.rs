@@ -131,9 +131,29 @@ pub(crate) struct App {
     system_theme: iced::theme::Mode,
     last_log_id: u64,
     pub(crate) error: Option<String>,
-    service_ready: bool,
+    snapshot_poll: SnapshotPoll,
     logs: Vec<LogRecord>,
     tray: Option<Tray>,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotPoll {
+    in_flight: bool,
+}
+
+impl SnapshotPoll {
+    fn begin(&mut self) -> bool {
+        if self.in_flight {
+            false
+        } else {
+            self.in_flight = true;
+            true
+        }
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = false;
+    }
 }
 
 pub(crate) fn boot() -> (App, Task<Message>) {
@@ -172,7 +192,7 @@ pub(crate) fn boot() -> (App, Task<Message>) {
         system_theme,
         last_log_id: 0,
         error: settings_error.map(|error| error.to_string()).or(tray_error),
-        service_ready: false,
+        snapshot_poll: SnapshotPoll::default(),
         tray,
     };
     (
@@ -213,12 +233,11 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::DaemonReady(result) => {
             match result {
                 Ok(()) => {
-                    app.service_ready = true;
                     app.error = None;
                 }
                 Err(error) => app.error = Some(error),
             }
-            refresh_task(app.last_log_id)
+            poll_snapshot(app)
         }
         Message::Tick => {
             if app.navigation.selected() == Page::Settings {
@@ -231,22 +250,19 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
             if instance::drain_show_requests() {
                 tasks.push(Task::done(Message::ShowWindow));
             }
-            if app.service_ready {
-                tasks.push(refresh_task(app.last_log_id));
-            }
+            tasks.push(poll_snapshot(app));
             Task::batch(tasks)
         }
         Message::ServiceUpdated { snapshot, logs } => {
+            app.snapshot_poll.finish();
             match snapshot {
                 Ok(snapshot) => {
                     app.snapshot = snapshot;
-                    app.service_ready = true;
                     if app.error.as_deref().is_some_and(is_service_error) {
                         app.error = None;
                     }
                 }
                 Err(error) => {
-                    app.service_ready = false;
                     app.error = Some(error);
                 }
             }
@@ -434,7 +450,7 @@ pub(crate) fn update(app: &mut App, message: Message) -> Task<Message> {
                 Ok(ControlResponse::Error { message }) | Err(message) => app.error = Some(message),
                 Ok(_) => app.error = None,
             }
-            refresh_task(app.last_log_id)
+            poll_snapshot(app)
         }
         Message::LogViewer(action) => app.log_viewer.update(action, &app.log_entries),
         Message::ClearLogView => {
@@ -501,7 +517,11 @@ fn download_task(asset: ReleaseAsset) -> Task<Message> {
     Task::run(updater::download(asset), Message::DownloadEvent)
 }
 
-fn refresh_task(after: u64) -> Task<Message> {
+fn poll_snapshot(app: &mut App) -> Task<Message> {
+    if !app.snapshot_poll.begin() {
+        return Task::none();
+    }
+    let after = app.last_log_id;
     Task::perform(service::fetch(after), |(snapshot, logs)| {
         Message::ServiceUpdated { snapshot, logs }
     })
@@ -568,3 +588,7 @@ fn is_service_error(value: &str) -> bool {
         .iter()
         .any(|marker| value.contains(marker))
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/application.rs"]
+mod tests;

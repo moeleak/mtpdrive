@@ -10,7 +10,7 @@ pub(super) fn view(app: &App) -> material::Element<'_, Message> {
     let strings = app.language.strings();
     let mount_description = format_mount_state(app.language, &app.snapshot.mount);
 
-    let mut action_items: Vec<material::Element<'_, Message>> = Vec::with_capacity(3);
+    let mut action_items: Vec<material::Element<'_, Message>> = Vec::with_capacity(2);
     if !matches!(app.snapshot.mount, MountState::Mounted { .. }) {
         action_items.push(
             button::button(strings.mount, button::ButtonVariant::Filled)
@@ -18,14 +18,11 @@ pub(super) fn view(app: &App) -> material::Element<'_, Message> {
                 .into(),
         );
     }
-    action_items.extend([
+    action_items.push(
         button::button(strings.open_in_finder, button::ButtonVariant::FilledTonal)
             .on_press(Message::OpenFinder)
             .into(),
-        button::button(strings.rescan, button::ButtonVariant::Text)
-            .on_press(Message::RefreshDevices)
-            .into(),
-    ]);
+    );
     let actions = page::row(action_items);
 
     let status = container::filled_card(
